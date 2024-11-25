@@ -111,18 +111,6 @@ void stop_task(RepeateableTask task)
  * Setup
  ********************/
 
-typedef struct {
-  unsigned long millis;
-  bool (*routine)();
-} TimedTask;
-
-TimedTask timed_tasks[] = {
-  {200, &read_door_status},
-  {200, &read_load},
-  {200, &check_buyers},
-  {1000, []() {Serial.println("Timer"); return true;}}
-};
-
 void setup()
 {
 	// Inputs
@@ -141,20 +129,11 @@ void setup()
 
 	Serial.begin(115200);
 
-  for(int i = 0; i < sizeof(timed_tasks) / sizeof(TimedTask); i++) {
-    timer.every(timed_tasks[i].millis, timed_tasks[i].routine);
-  }
-	// timer.every(200, read_door_status);
-	// timer.every(200, read_load);
-	// timer.every(200, check_buyers);
-  // timer.every(1000, []() { 
-  //   Serial.println("Timer");
-  //   return true;
-  //   });
+	timer.every(200, read_door_status);
+	timer.every(200, read_load);
+	timer.every(200, check_buyers);
 
-  noInterrupts();
   analogReference(INTERNAL2V56);
-  interrupts();
 
 	set_up_state_machine();
 
@@ -173,8 +152,7 @@ unsigned long long count = 0;
 
 void loop()
 {
-  // count++;
-  // if(count % 10 == 0) Serial.println("Loop");
+  timer.tick();
 	state_machine.Update();
 
   digitalWrite(DOOR_OUTPUT, state.door_open ? HIGH : LOW);
@@ -261,8 +239,6 @@ bool read_load()
 
 bool read_door_status()
 {
-  Serial.print("Reading door status: ");
-  Serial.println(pullupRead(DOOR_INPUT) == HIGH ? "High" : "Low");
 	if(pullupRead(DOOR_INPUT) == LOW) {
     return true;
   }
