@@ -191,66 +191,8 @@ private:
   bool is_dead = false;
   uint16_t read_interval_millis;
   uint16_t report_interval_millis;
-  Timer<>::Task report_task;
 
-  bool send_report()
-  {
-    float sum = 0;
-    for (int i = 0; i < mem_size; i++)
-    {
-      sum += mem[i];
-    }
-    float avg = sum / mem_size;
-    mem_index = 0;
-
-    // COMMUNICATION
-    bool comm_failure = false;
-    char buff[10] = {0};
-
-    floatToString(min_value, buff, sizeof(buff), 3);
-    if (COMMS_ENABLED)
-    {
-      comm_failure = comm_failure || !g_modem.publishData("min", buff);
-    }
-    else
-    {
-      Serial.print(name + " report -> ");
-      Serial.print("Min: ");
-      Serial.print(buff);
-      Serial.print(" || ");
-    }
-
-    floatToString(max_value, buff, sizeof(buff), 3);
-    if (COMMS_ENABLED)
-    {
-      comm_failure = comm_failure || !g_modem.publishData("max", buff);
-    }
-    else
-    {
-      Serial.print("Max: ");
-      Serial.print(buff);
-      Serial.print(" || ");
-    }
-
-    floatToString(avg, buff, sizeof(buff), 3);
-    if (COMMS_ENABLED)
-    {
-      comm_failure = comm_failure || !g_modem.publishData("avg", buff);
-    }
-    else
-    {
-      Serial.print("Avg: ");
-      Serial.println(buff);
-    }
-
-    if (comm_failure)
-    {
-      Serial.print("ERROR: failed to send report.");
-    }
-    return true;
-  }
-
-public:
+  public:
   AnalogSensor(
       String name,
       uint8_t port,
@@ -273,13 +215,11 @@ public:
   {
     this->mem_size = (this->report_interval_millis / this->read_interval_millis) + 1;
     this->mem = new float[mem_size];
-    this->report_task = timer.every(this->report_interval_millis, &this->send_report);
   }
 
   ~AnalogSensor()
   {
     delete[] mem;
-    timer.cancel(this->report_task);
   }
 
   float read()
@@ -344,9 +284,60 @@ public:
     return is_dead;
   }
 
-  void manual_report()
+  void send_report()
   {
-    this->send_report();
+    float sum = 0;
+    for (int i = 0; i < mem_size; i++)
+    {
+      sum += mem[i];
+    }
+    float avg = sum / mem_size;
+    mem_index = 0;
+
+    // COMMUNICATION
+    bool comm_failure = false;
+    char buff[10] = {0};
+
+    floatToString(min_value, buff, sizeof(buff), 3);
+    if (COMMS_ENABLED)
+    {
+      comm_failure = comm_failure || !g_modem.publishData("min", buff);
+    }
+    else
+    {
+      Serial.print(name + " report -> ");
+      Serial.print("Min: ");
+      Serial.print(buff);
+      Serial.print(" || ");
+    }
+
+    floatToString(max_value, buff, sizeof(buff), 3);
+    if (COMMS_ENABLED)
+    {
+      comm_failure = comm_failure || !g_modem.publishData("max", buff);
+    }
+    else
+    {
+      Serial.print("Max: ");
+      Serial.print(buff);
+      Serial.print(" || ");
+    }
+
+    floatToString(avg, buff, sizeof(buff), 3);
+    if (COMMS_ENABLED)
+    {
+      comm_failure = comm_failure || !g_modem.publishData("avg", buff);
+    }
+    else
+    {
+      Serial.print("Avg: ");
+      Serial.println(buff);
+    }
+
+    if (comm_failure)
+    {
+      Serial.print("ERROR: failed to send report.");
+    }
   }
 };
 
@@ -440,6 +431,11 @@ void setup()
 	timer.every(200, read_door_status);
 	timer.every(200, read_load);
 	timer.every(200, check_buyers);
+  timer.every(1000, []() {
+    state.load = load_cell.read();
+    return true;
+  });
+  timer.every(SEND_REPORT_MILLIS, []() {load_cell.send_report(); return true;});
 
   analogReference(INTERNAL2V56);
 
