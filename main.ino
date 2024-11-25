@@ -541,9 +541,13 @@ bool read_load()
 	return true;
 }
 
+bool previous_status = LOW;
+
 bool read_door_status()
 {
-	if(pullupRead(DOOR_INPUT) == LOW) {
+    bool status = pullupRead(DOOR_INPUT);
+
+	if(status == LOW || previous_status == status) {
     return true;
   }
 
