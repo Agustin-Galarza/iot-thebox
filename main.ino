@@ -1,0 +1,250 @@
+#include <StateMachineLib.h>
+#include <RIC3D.h>
+#include <arduino-timer.h>
+
+/*******************
+ * Configurations
+ ********************/
+#define MAX_DELIVERY_MILLIS 5000
+/*******************
+ * IO Configuration
+ ********************/
+// Inputs
+#define DOOR_INPUT DI1
+#define BUY_INPUT DI0
+#define LOAD_INPUT AI0
+
+// Outputs
+#define DOOR_OUTPUT DO0
+#define LOCK_OUTPUT DO1
+// Output LEDs
+#define STATUS_LED LED1
+#define OUTPUT_LED1 LED2
+#define OUTPUT_LED2 LED3
+#define ERROR_LED LED4
+/*******************
+ * Miscelaneous Configuration
+ ********************/
+#define TIMER_CONCURRENT_TASKS 4
+
+/*******************
+ * Types
+ ********************/
+
+enum State
+{
+	Available = 0,
+	Reserved = 1,
+	BuyerAuthenticated = 2,
+	DealerAuthenticated = 3,
+	ProductInside = 4,
+	ProductSecured = 5,
+	Illegal = 6
+};
+#define STATE_ENUM_COUNT 7
+
+typedef struct
+{
+	Timer<>::Task task_ref;
+	bool (*fn)();
+	unsigned long millis;
+} RepeateableTask;
+
+RIC3D device;
+Timer<TIMER_CONCURRENT_TASKS> timer;
+StateMachine state_machine(STATE_ENUM_COUNT, 4);
+
+/*******************
+ * Function definitions
+ ********************/
+
+void set_up_state_machine();
+bool flash_error_led();
+// Timed tasks
+bool read_load();
+bool read_door_status();
+bool check_buyers();
+
+// Utils
+uint8_t pullupRead(uint8_t pin)
+{
+	return !digitalRead(pin);
+}
+
+/*******************
+ * Box State
+ ********************/
+
+struct
+{
+	bool door_open;
+	bool lock_open;
+	bool reserved;
+	bool dealer_authenticated;
+	bool buyer_authenticated;
+	float load;
+
+	struct
+	{
+		RepeateableTask flash_error = {nullptr, flash_error_led, 200};
+	} repeatable_tasks;
+} state;
+
+void start_task(RepeateableTask task)
+{
+	if (task.task_ref == nullptr)
+	{
+		task.task_ref = timer.every(task.millis, task.fn);
+	}
+}
+
+void stop_task(RepeateableTask task)
+{
+	if (task.task_ref != nullptr)
+	{
+		timer.cancel(task.task_ref);
+		task.task_ref = nullptr;
+	}
+}
+
+/*******************
+ * Setup
+ ********************/
+
+void setup()
+{
+	// Inputs
+	pinMode(DOOR_INPUT, INPUT_PULLUP);
+	pinMode(BUY_INPUT, INPUT_PULLUP);
+	pinMode(LOAD_INPUT, INPUT);
+	// Outputs
+	pinMode(DOOR_OUTPUT, OUTPUT);
+	pinMode(LOCK_OUTPUT, OUTPUT);
+	// Output LEDs
+	pinMode(STATUS_LED, OUTPUT);
+	pinMode(OUTPUT_LED1, OUTPUT);
+	pinMode(OUTPUT_LED2, OUTPUT);
+	pinMode(ERROR_LED, OUTPUT);
+
+	Serial.begin(115200);
+
+	timer.every(200, read_door_status);
+	timer.every(200, read_load);
+	timer.every(200, check_buyers);
+
+	set_up_state_machine();
+
+	state_machine.SetState(Available, true, false);
+
+	digitalWrite(STATUS_LED, HIGH);
+	Serial.println("Device ready");
+}
+
+void loop()
+{
+	state_machine.Update();
+
+	delay(200);
+}
+
+/*******************
+ * Function implementations
+ ********************/
+
+void set_up_state_machine()
+{
+	/**************************
+	 * Transitions
+	 ***************************/
+	// Available
+	state_machine.AddTransition(Available, Reserved, []()
+								{ return state.reserved; });
+	state_machine.AddTransition(Available, Illegal, []()
+								{ return state.load != 0; });
+	// Reserved
+	state_machine.AddTransition(Reserved, DealerAuthenticated, []()
+								{ return state.dealer_authenticated; });
+	state_machine.AddTransition(Reserved, Illegal, []()
+								{ return state.load != 0; });
+	// BuyerAuthenticated
+	state_machine.AddTransition(DealerAuthenticated, ProductInside, []()
+								{ return state.load != 0; });
+	// ProductInside
+	state_machine.AddTransition(ProductInside, DealerAuthenticated, []()
+								{ return state.load == 0; });
+	state_machine.AddTransition(ProductInside, ProductSecured, []() // TODO: store the load and check also for weight changes
+								{ return !state.door_open && state.load != 0 && !state.lock_open; });
+	// ProductSecured
+	state_machine.AddTransition(ProductSecured, BuyerAuthenticated, []()
+								{ return state.buyer_authenticated; });
+	// BuyerAuthenticated
+	state_machine.AddTransition(BuyerAuthenticated, Available, []()
+								{ return state.door_open && state.load == 0; });
+	// Illegal
+
+	/**************************
+	 * State Events
+	 ***************************/
+	state_machine.SetOnEntering(Available, []()
+								{ return; });
+	state_machine.SetOnEntering(Reserved, []()
+								{ state.dealer_authenticated = true; });
+	state_machine.SetOnEntering(DealerAuthenticated, []()
+								{ 
+		// Dealer has a limited time to open the door and secure the product
+		timer.in(MAX_DELIVERY_MILLIS, []() {
+			if (state_machine.GetCurrentState() == DealerAuthenticated)
+			{
+				state_machine.SetState(Illegal, true, false);
+			}
+		}); });
+	state_machine.SetOnEntering(ProductInside, []()
+								{ state.lock_open = false; });
+	state_machine.SetOnEntering(ProductSecured, []()
+								{ state.buyer_authenticated = true; });
+	state_machine.SetOnEntering(BuyerAuthenticated, []()
+								{ state.lock_open = true; });
+	state_machine.SetOnEntering(Illegal, []()
+								{ start_task(state.repeatable_tasks.flash_error); });
+
+	state_machine.SetOnLeaving(Reserved, []()
+							   { state.dealer_authenticated = false; }); // Reset state
+	state_machine.SetOnLeaving(ProductSecured, []()
+							   { return state.buyer_authenticated = false; }); // Reset state
+	state_machine.SetOnLeaving(Illegal, []()
+							   { stop_task(state.repeatable_tasks.flash_error); });
+}
+
+bool read_load()
+{
+	state.load = analogRead(LOAD_INPUT);
+	return true;
+}
+
+bool read_door_status()
+{
+	bool new_door_status = pullupRead(DOOR_INPUT);
+
+	// Cannot open door if lock is closed
+	if (new_door_status && !state.lock_open)
+	{
+		return true;
+	}
+
+	state.door_open = new_door_status;
+	return true;
+}
+
+bool check_buyers()
+{
+	if (!state.reserved && pullupRead(BUY_INPUT) == HIGH)
+	{
+		state.reserved = true;
+	}
+}
+
+bool flash_error_led()
+{
+	digitalWrite(ERROR_LED, !digitalRead(ERROR_LED));
+	return true;
+}
