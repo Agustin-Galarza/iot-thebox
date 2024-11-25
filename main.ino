@@ -1,11 +1,16 @@
+#include <RIC3DMODEM.h>
 #include <StateMachineLib.h>
 #include <RIC3D.h>
 #include <arduino-timer.h>
+#include <floatToString.h>
 
 /*******************
  * Configurations
  ********************/
 #define MAX_DELIVERY_MILLIS 5000
+#define PLOTS_ENABLED false
+#define COMMS_ENABLED false
+#define SEND_REPORT_MILLIS 60000
 /*******************
  * IO Configuration
  ********************/
@@ -26,6 +31,8 @@
  * Miscelaneous Configuration
  ********************/
 #define TIMER_CONCURRENT_TASKS 6
+#define PORT_CORRECTION_FACTOR 40
+#define SerialAT Serial3 // 4G modem comms
 
 /*******************
  * Types
@@ -50,9 +57,310 @@ typedef struct
 	unsigned long millis;
 } RepeateableTask;
 
+/*******************
+ * Instances
+ ********************/
+
 RIC3D device;
+RIC3DMODEM g_modem;
 auto timer = timer_create_default();
 StateMachine state_machine(STATE_ENUM_COUNT, 9);
+
+/*********************************
+ * Filters
+ **********************************/
+class Filter
+{
+public:
+  virtual float apply(float value) = 0;
+};
+
+class SMA : public Filter
+{
+public:
+  SMA(uint8_t period)
+      : period(period)
+  {
+    sma_values = new float[period];
+    for (int i = 0; i < period; i++)
+    {
+      sma_values[i] = 0;
+    }
+  }
+  SMA()
+      : SMA(5) {}
+  ~SMA()
+  {
+    delete[] sma_values;
+  }
+  float apply(float new_value)
+  {
+    sma_values[sma_index++] = new_value;
+    sma_index %= period;
+    float sum = 0;
+    for (int i = 0; i < period; i++)
+    {
+      sum += sma_values[i];
+    }
+
+    return sum / period;
+  }
+
+  float alt_update(float new_value)
+  {
+    sma_sum -= sma_values[sma_index];
+    sma_sum += new_value;
+    sma_values[sma_index] = new_value;
+    sma_index = ++sma_index % period;
+    return (sma_sum) / period;
+  }
+
+private:
+  uint8_t period;
+  float *sma_values;
+  uint8_t sma_index = 0;
+  float sma_sum = 0;
+};
+
+class EMA : public Filter
+{
+public:
+  EMA(float _alpha)
+  {
+    alpha = _alpha;
+  }
+  EMA()
+      : EMA(0.1) {}
+  float apply(float new_value)
+  {
+    ema = alpha * new_value + (1 - alpha) * ema;
+    return ema;
+  }
+
+private:
+  float alpha;
+  float ema = 0.0;
+};
+
+/**************************************
+ * COMMS
+ *************************************/
+
+// Modem configuration 
+const char apn[] = "grupotesacom.claro.com.ar"; // mobile network APN
+const char apn_user[] = "";                     // GPRS User (if needed)
+const char apn_password[] = "";                 // GPRS Password (if needed)
+
+const char mqtt_user[] = "vBSeBu64ji8qaHCZMLZo"; // Here goes the tdata device TOKEN
+const char mqtt_host[] = "10.25.1.152";
+const char mqtt_port[] = "4094";
+const char *mqtt_password = NULL;
+
+// Module baud rate
+uint32_t rate = 115200;
+
+// Select SIM Card (0 = right, 1 = left)
+bool sim_selected = 1;
+
+void modem_setup();
+int modem_init();
+void comm_init();
+
+/**************************************
+ * SENSORS
+ **************************************/
+
+class AnalogSensor
+{
+private:
+  String name;
+  uint8_t port;
+  float correction;
+  float *mem;
+  uint8_t mem_size;
+  uint8_t mem_index = 0;
+  Filter *filter;
+  float last_raw_value = 0;
+  float last_value = 0;
+  float last_computed_value = 0;
+  float min_value = 0;
+  float max_value = 0;
+  bool use_filter_for_report;
+  float unit_zero;
+  float unit_factor;
+  bool is_dead = false;
+  uint16_t read_interval_millis;
+  uint16_t report_interval_millis;
+  Timer<>::Task report_task;
+
+  bool send_report()
+  {
+    float sum = 0;
+    for (int i = 0; i < mem_size; i++)
+    {
+      sum += mem[i];
+    }
+    float avg = sum / mem_size;
+    mem_index = 0;
+
+    // COMMUNICATION
+    bool comm_failure = false;
+    char buff[10] = {0};
+
+    floatToString(min_value, buff, sizeof(buff), 3);
+    if (COMMS_ENABLED)
+    {
+      comm_failure = comm_failure || !g_modem.publishData("min", buff);
+    }
+    else
+    {
+      Serial.print(name + " report -> ");
+      Serial.print("Min: ");
+      Serial.print(buff);
+      Serial.print(" || ");
+    }
+
+    floatToString(max_value, buff, sizeof(buff), 3);
+    if (COMMS_ENABLED)
+    {
+      comm_failure = comm_failure || !g_modem.publishData("max", buff);
+    }
+    else
+    {
+      Serial.print("Max: ");
+      Serial.print(buff);
+      Serial.print(" || ");
+    }
+
+    floatToString(avg, buff, sizeof(buff), 3);
+    if (COMMS_ENABLED)
+    {
+      comm_failure = comm_failure || !g_modem.publishData("avg", buff);
+    }
+    else
+    {
+      Serial.print("Avg: ");
+      Serial.println(buff);
+    }
+
+    if (comm_failure)
+    {
+      Serial.print("ERROR: failed to send report.");
+    }
+    return true;
+  }
+
+public:
+  AnalogSensor(
+      String name,
+      uint8_t port,
+      float unit_zero,
+      float unit_factor,
+      uint16_t read_interval_millis,
+      uint16_t report_interval_millis,
+      Filter *filter,
+      float correction = 0,
+      bool use_filter_for_report = true)
+      : name(name),
+        port(port),
+        unit_zero(unit_zero),
+        unit_factor(unit_factor),
+        read_interval_millis(read_interval_millis),
+        report_interval_millis(report_interval_millis),
+        filter(filter),
+        correction(correction),
+        use_filter_for_report(use_filter_for_report)
+  {
+    this->mem_size = (this->report_interval_millis / this->read_interval_millis) + 1;
+    this->mem = new float[mem_size];
+    this->report_task = timer.every(this->report_interval_millis, &this->send_report);
+  }
+
+  ~AnalogSensor()
+  {
+    delete[] mem;
+    timer.cancel(this->report_task);
+  }
+
+  float read()
+  {
+    float sensor_value = analogRead(port) / PORT_CORRECTION_FACTOR + correction;
+
+    if (sensor_value < 4 || sensor_value > 20)
+    {
+      if (!is_dead)
+      {
+        is_dead = true;
+        return -1;
+      }
+    }
+    if (filter != nullptr)
+    {
+      last_value = filter->apply(sensor_value);
+      if (use_filter_for_report)
+      {
+        sensor_value = last_value;
+      }
+    }
+    if (PLOTS_ENABLED)
+    {
+      Serial.print(sensor_value);
+      Serial.print(", ");
+    }
+
+    if (mem_index == mem_size)
+    {
+      Serial.print("Memory overload on sensor " + name);
+      return -1;
+    }
+    last_computed_value = sensor_value * unit_factor + unit_zero;
+    mem[mem_index++] = last_computed_value;
+
+    return last_computed_value;
+  }
+
+  float get_last_raw_value()
+  {
+    return last_raw_value;
+  }
+
+  float get_last_value()
+  {
+    return last_value;
+  }
+
+  float get_last_computed_value()
+  {
+    return last_computed_value;
+  }
+
+  String get_name()
+  {
+    return name;
+  }
+
+  bool get_is_dead()
+  {
+    return is_dead;
+  }
+
+  void manual_report()
+  {
+    this->send_report();
+  }
+};
+
+SMA load_cell_filter(20);
+AnalogSensor load_cell(
+    "Load Cell",
+    LOAD_INPUT,
+    4 / 16,
+    50 / 16,
+    200,
+    SEND_REPORT_MILLIS,
+    &load_cell_filter,
+    -0.3,
+    true);
 
 /*******************
  * Function definitions
@@ -266,3 +574,65 @@ bool flash_error_led()
 	digitalWrite(ERROR_LED, !digitalRead(ERROR_LED));
 	return true;
 }
+
+void modem_setup()
+{
+
+  Serial.println(F("modem_setup()"));
+  pinMode(SIM_SELECT, OUTPUT);
+  SerialAT.begin(rate);
+  g_modem.begin(&SerialAT, &Serial, true, true); // depuración + at dump
+
+  digitalWrite(SIM_SELECT, sim_selected);
+
+  g_modem.turnOff();
+
+  g_modem.turnOn();
+}
+
+int modem_init()
+{
+  int result;
+
+  Serial.println(F("modem_init()"));
+  Serial.print("connecting to port ");
+  Serial.println(mqtt_port);
+  g_modem.test();
+
+  if (result = g_modem.test())
+    return result;
+
+  Serial.println(F("ok - test passed"));
+
+  g_modem.deactivatePDPContext();
+
+  if (result = g_modem.createPDPContext(apn, apn_user, apn_password))
+    return result;
+
+  Serial.println(F("ok - PDP context created"));
+
+  if (result = g_modem.activatePDPContext())
+    return result;
+
+  Serial.println(F("ok - PDP context activated"));
+
+  if (result = g_modem.connectMQTTClient(mqtt_host, mqtt_port, mqtt_user, mqtt_password))
+    return result;
+
+  Serial.println(F("ok - MQTT client connected"));
+
+  return result;
+}
+
+void comm_init()
+{
+  modem_setup();
+  int result;
+  while (result = modem_init())
+  {
+    Serial.print(F("FAILURE! -> "));
+    Serial.println(result);
+    delay(10000);
+  }
+}
+
