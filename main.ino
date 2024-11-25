@@ -25,7 +25,7 @@
 /*******************
  * Miscelaneous Configuration
  ********************/
-#define TIMER_CONCURRENT_TASKS 4
+#define TIMER_CONCURRENT_TASKS 6
 
 /*******************
  * Types
@@ -51,8 +51,8 @@ typedef struct
 } RepeateableTask;
 
 RIC3D device;
-Timer<TIMER_CONCURRENT_TASKS> timer;
-StateMachine state_machine(STATE_ENUM_COUNT, 4);
+auto timer = timer_create_default();
+StateMachine state_machine(STATE_ENUM_COUNT, 9);
 
 /*******************
  * Function definitions
@@ -111,12 +111,25 @@ void stop_task(RepeateableTask task)
  * Setup
  ********************/
 
+typedef struct {
+  unsigned long millis;
+  bool (*routine)();
+} TimedTask;
+
+TimedTask timed_tasks[] = {
+  {200, &read_door_status},
+  {200, &read_load},
+  {200, &check_buyers},
+  {1000, []() {Serial.println("Timer"); return true;}}
+};
+
 void setup()
 {
 	// Inputs
 	pinMode(DOOR_INPUT, INPUT_PULLUP);
 	pinMode(BUY_INPUT, INPUT_PULLUP);
 	pinMode(LOAD_INPUT, INPUT);
+  pinMode(AI1, INPUT);
 	// Outputs
 	pinMode(DOOR_OUTPUT, OUTPUT);
 	pinMode(LOCK_OUTPUT, OUTPUT);
@@ -128,23 +141,46 @@ void setup()
 
 	Serial.begin(115200);
 
-	timer.every(200, read_door_status);
-	timer.every(200, read_load);
-	timer.every(200, check_buyers);
+  for(int i = 0; i < sizeof(timed_tasks) / sizeof(TimedTask); i++) {
+    timer.every(timed_tasks[i].millis, timed_tasks[i].routine);
+  }
+	// timer.every(200, read_door_status);
+	// timer.every(200, read_load);
+	// timer.every(200, check_buyers);
+  // timer.every(1000, []() { 
+  //   Serial.println("Timer");
+  //   return true;
+  //   });
+
+  noInterrupts();
+  analogReference(INTERNAL2V56);
+  interrupts();
 
 	set_up_state_machine();
 
 	state_machine.SetState(Available, true, false);
 
 	digitalWrite(STATUS_LED, HIGH);
-	Serial.println("Device ready");
+
+  // Default state
+  state.door_open = true;
+  state.lock_open = true;
+
+	Serial.println("Device ready V2");
 }
+
+unsigned long long count = 0;
 
 void loop()
 {
+  // count++;
+  // if(count % 10 == 0) Serial.println("Loop");
 	state_machine.Update();
 
-	delay(200);
+  digitalWrite(DOOR_OUTPUT, state.door_open ? HIGH : LOW);
+  digitalWrite(LOCK_OUTPUT, state.lock_open ? HIGH : LOW);
+
+	delay(100);
 }
 
 /*******************
@@ -153,6 +189,7 @@ void loop()
 
 void set_up_state_machine()
 {
+  Serial.println("Setting up state machine...");
 	/**************************
 	 * Transitions
 	 ***************************/
@@ -193,7 +230,7 @@ void set_up_state_machine()
 								{ 
 		// Dealer has a limited time to open the door and secure the product
 		timer.in(MAX_DELIVERY_MILLIS, []() {
-			if (state_machine.GetCurrentState() == DealerAuthenticated)
+			if (state_machine.GetState() == DealerAuthenticated)
 			{
 				state_machine.SetState(Illegal, true, false);
 			}
@@ -213,6 +250,7 @@ void set_up_state_machine()
 							   { return state.buyer_authenticated = false; }); // Reset state
 	state_machine.SetOnLeaving(Illegal, []()
 							   { stop_task(state.repeatable_tasks.flash_error); });
+  Serial.println("State machine set.");
 }
 
 bool read_load()
@@ -223,15 +261,19 @@ bool read_load()
 
 bool read_door_status()
 {
-	bool new_door_status = pullupRead(DOOR_INPUT);
+  Serial.print("Reading door status: ");
+  Serial.println(pullupRead(DOOR_INPUT) == HIGH ? "High" : "Low");
+	if(pullupRead(DOOR_INPUT) == LOW) {
+    return true;
+  }
 
 	// Cannot open door if lock is closed
-	if (new_door_status && !state.lock_open)
+	if (!state.door_open && !state.lock_open)
 	{
 		return true;
 	}
 
-	state.door_open = new_door_status;
+  state.door_open = !state.door_open;
 	return true;
 }
 
