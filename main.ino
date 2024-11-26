@@ -30,7 +30,7 @@ const char *device_id = "the-box-sm-ml-01";
 // Inputs
 #define DOOR_INPUT DI0
 #define BUY_INPUT DI1
-#define LOAD_INPUT AI1
+#define LOAD_INPUT AI0
 #define AUTH_BUYER_INPUT DI2
 #define AUTH_DEALER_INPUT DI3
 
@@ -501,42 +501,58 @@ void loop()
   digitalWrite(DOOR_OUTPUT, state.door_open ? HIGH : LOW);
   digitalWrite(LOCK_OUTPUT, state.lock_open ? HIGH : LOW);
 
-#ifdef COMMS_ENABLED
   if (state.load_change > 0.1)
   {
     char weight_delta[10] = {0};
     floatToString(state.load_change, weight_delta, sizeof(weight_delta), 3);
+#ifdef COMMS_ENABLED
     if (!g_modem.publishData("weightChange", weight_delta))
     {
       Serial.println("ERROR: Could not send weight change through comms.");
     }
+#else
+    Serial.print("ALERT: { weightChange: ");
+    Serial.print(weight_delta);
+    Serial.println("}");
+#endif
     state.load_change = 0;
   }
   if (state.send_open_alarm)
   {
+#ifdef COMMS_ENABLED
     if (!g_modem.publishData("openAlarm", "true"))
     {
       Serial.println("ERROR: Could not send door status through comms.");
     }
+#else
+    Serial.println("ALERT: { openAlarm: true }");
+#endif
     state.send_open_alarm = false;
   }
   if (state.delivery_alarm)
   {
+#ifdef COMMS_ENABLED
     if (!g_modem.publishData("hasDelivery", "1"))
     {
       Serial.println("ERROR: Could not send delivery alarm through comms.");
     }
+#else
+    Serial.println("ALERT: { hasDelivery: 1 }");
+#endif
     state.delivery_alarm = false;
   }
   if (state.takeoff_alarm)
   {
+#ifdef COMMS_ENABLED
     if (!g_modem.publishData("hasTakeoff", "1"))
     {
       Serial.println("ERROR: Could not send takeoff alarm through comms.");
     }
+#else
+    Serial.println("ALERT: { hasTakeoff: 1 }");
+#endif
     state.takeoff_alarm = false;
   }
-#endif
 
   delay(100);
 }
@@ -843,15 +859,8 @@ bool send_load_report()
   return true;
 }
 
-/*
-    hasDelivery: currState === STATES[0] ? 0 : 1,
-    hasTakeoff: currState !== STATES[0] && currState !== STATES[3] ? 1 : 0,
-    */
-
 bool send_box_report()
 {
-#ifdef COMMS_ENABLED
-  bool comm_failure = false;
 
   char *current_state;
   switch (state_machine.GetState())
@@ -878,6 +887,9 @@ bool send_box_report()
   char weight_str[10] = {0};
   floatToString(state.load, weight_str, sizeof(weight_str), 3);
 
+#ifdef COMMS_ENABLED
+  bool comm_failure = false;
+
   comm_failure = comm_failure || !g_modem.publishData("id", device_id);
   comm_failure = comm_failure || !g_modem.publishData("isSmall", "1");
   comm_failure = comm_failure || !g_modem.publishData("weight", weight_str);
@@ -893,8 +905,19 @@ bool send_box_report()
     Serial.println("ERROR: Could not send box report. There was an error in the message transmission.");
   }
 #else
-  return false;
+  Serial.print("REPORT: { id: ");
+  Serial.print(device_id);
+  Serial.print(", isSmall: 1, weight: ");
+  Serial.print(weight_str);
+  Serial.print(", isOpen: " + state.door_open ? "true" : "false");
+  Serial.print(", consumption: " + (voltage * 6L) / 100);
+  Serial.print(", power: " + (voltage * 6L) / 100);
+  Serial.print(", isActive: " + voltage > 1000 ? "true" : "false");
+  Serial.print(", state: ");
+  Serial.print(current_state);
+  Serial.println(" }");
 #endif
+  return true;
 }
 
 long compute_vcc(void) // Returns actual value of Vcc (x 100)
