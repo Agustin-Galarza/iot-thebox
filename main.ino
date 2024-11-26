@@ -14,16 +14,16 @@ const char *device_id = "the-box-sm-ml-01";
 #define MIN_WEIGHT_THRESHOLD 2.5
 // lapse of time to check for digital input state
 #define DIGITAL_INPUT_READ_MILLIS 200
-#define LOAD_CHANGE_EPSILON 1
+#define LOAD_CHANGE_EPSILON 2
 
-#define COMMS_ENABLED
+// #define COMMS_ENABLED
 
 // Comment this line to set the door state as equals to the input state
 // #define DOOR_TOGGLE
 
 // Transitioning time of the system. From the system initialization up to
 // this point, the sensed values will be ignored because they're not reliable
-#define TRANSITION_MILLIS 10000
+#define TRANSITION_MILLIS 2000
 /*******************
  * IO Configuration
  ********************/
@@ -32,7 +32,7 @@ const char *device_id = "the-box-sm-ml-01";
 #define BUY_INPUT DI1
 #define LOAD_INPUT AI1
 #define AUTH_BUYER_INPUT DI2
-// #define AUTH_DEALER_INPUT DI3
+#define AUTH_DEALER_INPUT DI3
 
 // Outputs
 #define DOOR_OUTPUT DO1
@@ -166,10 +166,10 @@ const char apn[] = "grupotesacom.claro.com.ar"; // mobile network APN
 const char apn_user[] = "";                     // GPRS User (if needed)
 const char apn_password[] = "";                 // GPRS Password (if needed)
 
-const char mqtt_user[] = "vBSeBu64ji8qaHCZMLZo"; // Here goes the tdata device TOKEN
+const char mqtt_user[] = "DpezSvAXxmabASRN8kpP"; // Here goes the tdata device TOKEN
 const char mqtt_host[] = "10.25.1.152";
 const char mqtt_port[] = "4094";
-const char *mqtt_password = NULL;
+const char *mqtt_password = "";
 
 // Module baud rate
 uint32_t rate = 115200;
@@ -207,6 +207,9 @@ private:
   uint16_t read_interval_millis;
   uint16_t report_interval_millis;
 
+  unsigned long log_counter = 0;
+  int log_every = 2;
+
 public:
   AnalogSensor(
       String name,
@@ -241,8 +244,7 @@ public:
   {
     float sensor_value = analogRead(port) / PORT_CORRECTION_FACTOR + correction;
 
-    Serial.print(analogRead(port));
-    Serial.print(",");
+    int raw_value = analogRead(port); // For logging
 
     if (sensor_value < 4 || sensor_value > 20)
     {
@@ -275,7 +277,15 @@ public:
     }
     mem[mem_index++] = last_computed_value;
 
-    Serial.println(last_computed_value);
+    if (this->log_counter++ % this->log_every == 0)
+    {
+      Serial.print("Weight: ");
+      Serial.print(last_computed_value);
+      Serial.print(" kg (");
+      Serial.print(raw_value);
+      Serial.println(")");
+    }
+
     return last_computed_value;
   }
 
@@ -306,7 +316,6 @@ public:
 
   void send_report()
   {
-    Serial.println("Sending report");
     float sum = 0;
     for (int i = 0; i < mem_size; i++)
     {
@@ -317,35 +326,30 @@ public:
 
     // COMMUNICATION
     bool comm_failure = false;
-    char buff[10] = {0};
+    char min_str[10] = {0};
+    char max_str[10] = {0};
+    char avg_str[10] = {0};
 
-    floatToString(min_value, buff, sizeof(buff), 3);
+    floatToString(min_value, min_str, sizeof(min_str), 3);
+    floatToString(max_value, max_str, sizeof(max_str), 3);
+    floatToString(avg, avg_str, sizeof(avg_str), 3);
+
 #ifdef COMMS_ENABLED
-    comm_failure = comm_failure || !g_modem.publishData("min", buff);
+    Serial.println("Sending report");
+    comm_failure = comm_failure || !g_modem.publishData("min", min_str);
+    comm_failure = comm_failure || !g_modem.publishData("max", max_str);
+    comm_failure = comm_failure || !g_modem.publishData("avg", avg_str);
 #else
-    Serial.print(name + " report -> ");
-    Serial.print("Min: ");
-    Serial.print(buff);
-    Serial.print(" || ");
+    // Serial.print(name + " report -> ");
+    // Serial.print("Min: ");
+    // Serial.print(min_str);
+    // Serial.print(" || ");
+    // Serial.print("Max: ");
+    // Serial.print(max_str);
+    // Serial.print(" || ");
+    // Serial.print("Avg: ");
+    // Serial.println(avg_str);
 #endif
-
-    floatToString(max_value, buff, sizeof(buff), 3);
-#ifdef COMMS_ENABLED
-    comm_failure = comm_failure || !g_modem.publishData("max", buff);
-#else
-    Serial.print("Max: ");
-    Serial.print(buff);
-    Serial.print(" || ");
-#endif
-
-    floatToString(avg, buff, sizeof(buff), 3);
-#ifdef COMMS_ENABLED
-    comm_failure = comm_failure || !g_modem.publishData("avg", buff);
-#else
-    Serial.print("Avg: ");
-    Serial.println(buff);
-#endif
-
     if (comm_failure)
     {
       Serial.print("ERROR: failed to send report.");
@@ -353,7 +357,7 @@ public:
   }
 };
 
-SMA load_cell_filter(4);
+SMA load_cell_filter(2);
 AnalogSensor load_cell(
     "Load Cell",
     LOAD_INPUT,
@@ -401,6 +405,7 @@ struct
   bool buyer_authenticated;
   float load;
   // events
+  float product_inside_ts;        // millis when the product was placed
   float load_when_product_inside; // stores the load value when the product was placed in the box
   float load_change;              // != 0 if there was a change in the load that needs to be logged
   bool send_open_alarm;
@@ -413,11 +418,11 @@ struct
   } repeatable_tasks;
 } state;
 
-void start_task(RepeateableTask task)
+void start_task(RepeateableTask *task)
 {
-  if (task.task_ref == nullptr)
+  if (task->task_ref == nullptr)
   {
-    task.task_ref = timer.every(task.millis, task.fn);
+    task->task_ref = timer.every(task->millis, task->fn);
   }
 }
 
@@ -440,7 +445,6 @@ void setup()
   pinMode(DOOR_INPUT, INPUT_PULLUP);
   pinMode(BUY_INPUT, INPUT_PULLUP);
   pinMode(LOAD_INPUT, INPUT);
-  pinMode(AI1, INPUT);
 #ifdef AUTH_BUYER_INPUT
   pinMode(AUTH_BUYER_INPUT, INPUT_PULLUP);
 #endif
@@ -470,11 +474,6 @@ void setup()
   timer.every(DIGITAL_INPUT_READ_MILLIS, read_buyer_auth);
   timer.every(DIGITAL_INPUT_READ_MILLIS, read_dealer_auth);
   timer.every(SEND_REPORT_MILLIS, send_box_report);
-  timer.every(2000, []()
-              {
-    long vcc_100 = compute_vcc();
-    Serial.print("Vcc: ");
-    Serial.println(vcc_100 ); });
 
   analogReference(INTERNAL2V56);
 
@@ -562,19 +561,31 @@ void set_up_state_machine()
                               { return state.dealer_authenticated; });
   state_machine.AddTransition(Reserved, Illegal, []()
                               { return state.load > MIN_WEIGHT_THRESHOLD; });
-  // BuyerAuthenticated
+  // DealerAuthenticated
   state_machine.AddTransition(DealerAuthenticated, ProductInside, []()
                               { return state.load > MIN_WEIGHT_THRESHOLD; });
   // ProductInside
   state_machine.AddTransition(ProductInside, Illegal, []()
-                              { return abs(state.load - state.load_when_product_inside) > LOAD_CHANGE_EPSILON; });
+                              { if ((millis() - state.product_inside_ts > TRANSITION_MILLIS + 500) && abs(state.load - state.load_when_product_inside) > LOAD_CHANGE_EPSILON) {
+                                  Serial.print("Load when inside: ");
+                                  Serial.print(state.load_when_product_inside);
+                                  Serial.print("  ||  Current load: ");
+                                  Serial.println(state.load);
+                                return true;
+                              } return false; });
   state_machine.AddTransition(ProductInside, DealerAuthenticated, []()
                               { return state.load < MIN_WEIGHT_THRESHOLD; });
   state_machine.AddTransition(ProductInside, ProductSecured, []()
                               { return !state.door_open && state.load > MIN_WEIGHT_THRESHOLD && !state.lock_open; });
   // ProductSecured
   state_machine.AddTransition(ProductSecured, Illegal, []()
-                              { return abs(state.load - state.load_when_product_inside) > LOAD_CHANGE_EPSILON; });
+                              { if ((millis() - state.product_inside_ts > TRANSITION_MILLIS + 500) && abs(state.load - state.load_when_product_inside) > LOAD_CHANGE_EPSILON) {
+                                  Serial.print("Load when inside: ");
+                                  Serial.print(state.load_when_product_inside);
+                                  Serial.print("  ||  Current load: ");
+                                  Serial.println(state.load);
+                                return true;
+                              } return false; });
   state_machine.AddTransition(ProductSecured, BuyerAuthenticated, []()
                               { return state.buyer_authenticated; });
   // BuyerAuthenticated
@@ -590,7 +601,8 @@ void set_up_state_machine()
    * State Events
    ***************************/
   state_machine.SetOnEntering(Available, []()
-                              { state.load_when_product_inside = 0; });
+                              { state.load_when_product_inside = 0; 
+                                digitalWrite(OUTPUT_LED1, HIGH); });
 #ifndef AUTH_DEALER_INPUT
   state_machine.SetOnEntering(Reserved, []()
                               { state.dealer_authenticated = true; });
@@ -606,7 +618,11 @@ void set_up_state_machine()
 		}); });
   state_machine.SetOnEntering(ProductInside, []()
                               { state.lock_open = false; 
-                              state.load_when_product_inside = state.load; });
+                              timer.in(TRANSITION_MILLIS, [](){
+                                state.load_when_product_inside = state.load;
+                              });
+                              state.product_inside_ts = millis();
+                              digitalWrite(OUTPUT_LED2, HIGH); });
   state_machine.SetOnEntering(ProductSecured, []()
                               {
                                 state.delivery_alarm = true;
@@ -618,13 +634,16 @@ void set_up_state_machine()
   state_machine.SetOnEntering(BuyerAuthenticated, []()
                               { state.lock_open = true; });
   state_machine.SetOnEntering(Illegal, []()
-                              { start_task(state.repeatable_tasks.flash_error); });
+                              { start_task(&state.repeatable_tasks.flash_error); });
+  state_machine.SetOnLeaving(Available, []()
+                             { digitalWrite(OUTPUT_LED1, LOW); }); // Reset state
   state_machine.SetOnLeaving(Reserved, []()
                              { state.dealer_authenticated = false; }); // Reset state
   state_machine.SetOnLeaving(ProductSecured, []()
                              { return state.buyer_authenticated = false; }); // Reset state
   state_machine.SetOnLeaving(BuyerAuthenticated, []()
-                             { state.takeoff_alarm = true; });
+                             { state.takeoff_alarm = true;
+                                digitalWrite(OUTPUT_LED2, LOW); });
   state_machine.SetOnLeaving(Illegal, []()
                              { 
                               stop_task(state.repeatable_tasks.flash_error); 
@@ -773,9 +792,9 @@ void comm_init()
 
 void print_state()
 {
+  Serial.print("Current state: ");
   switch (state_machine.GetState())
   {
-    Serial.print("Current state: ");
   case Available:
     Serial.println("Available");
     break;
