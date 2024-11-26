@@ -7,13 +7,16 @@
 /*******************
  * Configurations
  ********************/
+const char *device_id = "the-box-sm-ml-01";
 #define MAX_DELIVERY_MILLIS 10000
-#define COMMS_ENABLED
 #define SEND_REPORT_MILLIS 60000
 #define READ_LOAD_MILLIS 1000
 #define MIN_WEIGHT_THRESHOLD 2.5
 // lapse of time to check for digital input state
 #define DIGITAL_INPUT_READ_MILLIS 200
+#define LOAD_CHANGE_EPSILON 1
+
+#define COMMS_ENABLED
 
 // Comment this line to set the door state as equals to the input state
 // #define DOOR_TOGGLE
@@ -76,7 +79,7 @@ typedef struct
 RIC3D device;
 RIC3DMODEM g_modem;
 auto timer = timer_create_default();
-StateMachine state_machine(STATE_ENUM_COUNT, 10);
+StateMachine state_machine(STATE_ENUM_COUNT, 12);
 
 /*********************************
  * Filters
@@ -369,6 +372,7 @@ AnalogSensor load_cell(
 void set_up_state_machine();
 bool flash_error_led();
 void print_state();
+long compute_vcc();
 // Timed tasks
 bool read_load();
 bool read_door_status();
@@ -376,6 +380,7 @@ bool check_for_reservation();
 bool read_dealer_auth();
 bool read_buyer_auth();
 bool send_load_report();
+bool send_box_report();
 
 // Utils
 uint8_t pullupRead(uint8_t pin)
@@ -395,6 +400,12 @@ struct
   bool dealer_authenticated;
   bool buyer_authenticated;
   float load;
+  // events
+  float load_when_product_inside; // stores the load value when the product was placed in the box
+  float load_change;              // != 0 if there was a change in the load that needs to be logged
+  bool send_open_alarm;
+  bool delivery_alarm;
+  bool takeoff_alarm;
 
   struct
   {
@@ -458,6 +469,12 @@ void setup()
   timer.every(2000, print_state);
   timer.every(DIGITAL_INPUT_READ_MILLIS, read_buyer_auth);
   timer.every(DIGITAL_INPUT_READ_MILLIS, read_dealer_auth);
+  timer.every(SEND_REPORT_MILLIS, send_box_report);
+  timer.every(2000, []()
+              {
+    long vcc_100 = compute_vcc();
+    Serial.print("Vcc: ");
+    Serial.println(vcc_100 ); });
 
   analogReference(INTERNAL2V56);
 
@@ -484,6 +501,43 @@ void loop()
 
   digitalWrite(DOOR_OUTPUT, state.door_open ? HIGH : LOW);
   digitalWrite(LOCK_OUTPUT, state.lock_open ? HIGH : LOW);
+
+#ifdef COMMS_ENABLED
+  if (state.load_change > 0.1)
+  {
+    char weight_delta[10] = {0};
+    floatToString(state.load_change, weight_delta, sizeof(weight_delta), 3);
+    if (!g_modem.publishData("weightChange", weight_delta))
+    {
+      Serial.println("ERROR: Could not send weight change through comms.");
+    }
+    state.load_change = 0;
+  }
+  if (state.send_open_alarm)
+  {
+    if (!g_modem.publishData("openAlarm", "true"))
+    {
+      Serial.println("ERROR: Could not send door status through comms.");
+    }
+    state.send_open_alarm = false;
+  }
+  if (state.delivery_alarm)
+  {
+    if (!g_modem.publishData("hasDelivery", "1"))
+    {
+      Serial.println("ERROR: Could not send delivery alarm through comms.");
+    }
+    state.delivery_alarm = false;
+  }
+  if (state.takeoff_alarm)
+  {
+    if (!g_modem.publishData("hasTakeoff", "1"))
+    {
+      Serial.println("ERROR: Could not send takeoff alarm through comms.");
+    }
+    state.takeoff_alarm = false;
+  }
+#endif
 
   delay(100);
 }
@@ -512,11 +566,15 @@ void set_up_state_machine()
   state_machine.AddTransition(DealerAuthenticated, ProductInside, []()
                               { return state.load > MIN_WEIGHT_THRESHOLD; });
   // ProductInside
+  state_machine.AddTransition(ProductInside, Illegal, []()
+                              { return abs(state.load - state.load_when_product_inside) > LOAD_CHANGE_EPSILON; });
   state_machine.AddTransition(ProductInside, DealerAuthenticated, []()
                               { return state.load < MIN_WEIGHT_THRESHOLD; });
-  state_machine.AddTransition(ProductInside, ProductSecured, []() // TODO: store the load and check also for weight changes
+  state_machine.AddTransition(ProductInside, ProductSecured, []()
                               { return !state.door_open && state.load > MIN_WEIGHT_THRESHOLD && !state.lock_open; });
   // ProductSecured
+  state_machine.AddTransition(ProductSecured, Illegal, []()
+                              { return abs(state.load - state.load_when_product_inside) > LOAD_CHANGE_EPSILON; });
   state_machine.AddTransition(ProductSecured, BuyerAuthenticated, []()
                               { return state.buyer_authenticated; });
   // BuyerAuthenticated
@@ -531,6 +589,8 @@ void set_up_state_machine()
   /**************************
    * State Events
    ***************************/
+  state_machine.SetOnEntering(Available, []()
+                              { state.load_when_product_inside = 0; });
 #ifndef AUTH_DEALER_INPUT
   state_machine.SetOnEntering(Reserved, []()
                               { state.dealer_authenticated = true; });
@@ -545,11 +605,16 @@ void set_up_state_machine()
 			}
 		}); });
   state_machine.SetOnEntering(ProductInside, []()
-                              { state.lock_open = false; });
-#ifndef AUTH_BUYER_INPUT
+                              { state.lock_open = false; 
+                              state.load_when_product_inside = state.load; });
   state_machine.SetOnEntering(ProductSecured, []()
-                              { Serial.println("Authenticating buyer automatically"); state.buyer_authenticated = true; });
+                              {
+                                state.delivery_alarm = true;
+#ifndef AUTH_BUYER_INPUT
+                                Serial.println("Authenticating buyer automatically");
+                                state.buyer_authenticated = true;
 #endif
+                              });
   state_machine.SetOnEntering(BuyerAuthenticated, []()
                               { state.lock_open = true; });
   state_machine.SetOnEntering(Illegal, []()
@@ -558,6 +623,8 @@ void set_up_state_machine()
                              { state.dealer_authenticated = false; }); // Reset state
   state_machine.SetOnLeaving(ProductSecured, []()
                              { return state.buyer_authenticated = false; }); // Reset state
+  state_machine.SetOnLeaving(BuyerAuthenticated, []()
+                             { state.takeoff_alarm = true; });
   state_machine.SetOnLeaving(Illegal, []()
                              { 
                               stop_task(state.repeatable_tasks.flash_error); 
@@ -565,22 +632,35 @@ void set_up_state_machine()
   Serial.println("State machine set.");
 }
 
+float previous_load = 0.0;
 bool read_load()
 {
+  float prev_load = state.load;
+
   state.load = load_cell.read();
+
+#ifdef COMMS_ENABLED
+  if (abs(prev_load - state.load) > LOAD_CHANGE_EPSILON)
+  {
+    state.load_change = prev_load - state.load;
+  }
+#endif
+
   return true;
 }
 
-bool previous_status = LOW;
+bool previous_door_input_status = LOW;
 
 bool read_door_status()
 {
+  bool door_was_open = state.door_open;
 #ifdef DOOR_TOGGLE
   bool status = pullupRead(DOOR_INPUT);
-  if (status == LOW || previous_status == status)
+  if (status == LOW || previous_door_input_status == status)
   {
     return true;
   }
+  previous_door_input_status = status;
 
   // Cannot open door if lock is closed
   if (!state.door_open && !state.lock_open)
@@ -589,7 +669,6 @@ bool read_door_status()
   }
 
   state.door_open = !state.door_open;
-  return true;
 #else
   // Set door state based on input
   auto new_state = pullupRead(DOOR_INPUT) == HIGH;
@@ -602,8 +681,15 @@ bool read_door_status()
     }
     state.door_open = new_state;
   }
-  return true;
 #endif
+#ifdef COMMS_ENABLED
+  if (!door_was_open && state.door_open)
+  {
+    state.send_open_alarm = true;
+  }
+#endif
+
+  return true;
 }
 
 bool check_for_reservation()
@@ -736,4 +822,77 @@ bool send_load_report()
 {
   load_cell.send_report();
   return true;
+}
+
+/*
+    hasDelivery: currState === STATES[0] ? 0 : 1,
+    hasTakeoff: currState !== STATES[0] && currState !== STATES[3] ? 1 : 0,
+    */
+
+bool send_box_report()
+{
+#ifdef COMMS_ENABLED
+  bool comm_failure = false;
+
+  char *current_state;
+  switch (state_machine.GetState())
+  {
+  case Available:
+    current_state = "Disponible";
+    break;
+  case Reserved:
+  case DealerAuthenticated:
+    current_state = "Reservada";
+    break;
+  case ProductInside:
+  case ProductSecured:
+  case BuyerAuthenticated:
+    current_state = "Cargado";
+    break;
+  default:
+    current_state = "Ilegal";
+    break;
+  }
+
+  long voltage = compute_vcc();
+
+  char weight_str[10] = {0};
+  floatToString(state.load, weight_str, sizeof(weight_str), 3);
+
+  comm_failure = comm_failure || !g_modem.publishData("id", device_id);
+  comm_failure = comm_failure || !g_modem.publishData("isSmall", "1");
+  comm_failure = comm_failure || !g_modem.publishData("weight", weight_str);
+  comm_failure = comm_failure || !g_modem.publishData("isOpen", state.door_open ? "true" : "false");
+  // comm_failure = comm_failure || !g_modem.publishData("temperature", "0");
+  comm_failure = comm_failure || !g_modem.publishData("consumption", (voltage * 6L) / 100);
+  comm_failure = comm_failure || !g_modem.publishData("power", (voltage * 6L) / 100);
+  comm_failure = comm_failure || !g_modem.publishData("isActive", voltage > 1000 ? "true" : "false");
+  comm_failure = comm_failure || !g_modem.publishData("state", current_state);
+
+  if (comm_failure)
+  {
+    Serial.println("ERROR: Could not send box report. There was an error in the message transmission.");
+  }
+#else
+  return false;
+#endif
+}
+
+long compute_vcc(void) // Returns actual value of Vcc (x 100)
+{
+  // Read 2.56V reference against AVcc
+  // set the reference to AVcc and the measurement to the internal 2.56V reference
+  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  delay(2);            // Wait for Vref to settle
+  ADCSRA |= _BV(ADSC); // Start conversion
+  while (bit_is_set(ADCSRA, ADSC))
+    ; // measuring
+
+  uint8_t low = ADCL;  // must read ADCL first - it then locks ADCH
+  uint8_t high = ADCH; // unlocks both
+
+  long result = (high << 8) | low;
+
+  result = 2560000L / result - 1000L; // Calculate Vcc (in mV); 2560000 = 2.56*1024*1000
+  return result;                      // Vcc in millivolts
 }
