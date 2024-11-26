@@ -7,21 +7,34 @@
 /*******************
  * Configurations
  ********************/
-#define MAX_DELIVERY_MILLIS 5000
+#define MAX_DELIVERY_MILLIS 10000
 #define PLOTS_ENABLED false
 #define COMMS_ENABLED false
 #define SEND_REPORT_MILLIS 60000
+#define READ_LOAD_MILLIS 1000
+#define MIN_WEIGHT_THRESHOLD 2.5
+// lapse of time to check for digital input state
+#define DIGITAL_INPUT_READ_MILLIS 200
+
+// Comment this line to set the door state as equals to the input state
+// #define DOOR_TOGGLE
+
+// Transitioning time of the system. From the system initialization up to
+// this point, the sensed values will be ignored because they're not reliable
+#define TRANSITION_MILLIS 10000
 /*******************
  * IO Configuration
  ********************/
 // Inputs
-#define DOOR_INPUT DI1
-#define BUY_INPUT DI0
-#define LOAD_INPUT AI0
+#define DOOR_INPUT DI0
+#define BUY_INPUT DI1
+#define LOAD_INPUT AI1
+#define AUTH_BUYER_INPUT DI2
+// #define AUTH_DEALER_INPUT DI3
 
 // Outputs
-#define DOOR_OUTPUT DO0
-#define LOCK_OUTPUT DO1
+#define DOOR_OUTPUT DO1
+#define LOCK_OUTPUT DO0
 // Output LEDs
 #define STATUS_LED LED1
 #define OUTPUT_LED1 LED2
@@ -31,7 +44,7 @@
  * Miscelaneous Configuration
  ********************/
 #define TIMER_CONCURRENT_TASKS 6
-#define PORT_CORRECTION_FACTOR 40
+#define PORT_CORRECTION_FACTOR 1
 #define SerialAT Serial3 // 4G modem comms
 
 /*******************
@@ -40,21 +53,21 @@
 
 enum State
 {
-	Available = 0,
-	Reserved = 1,
-	BuyerAuthenticated = 2,
-	DealerAuthenticated = 3,
-	ProductInside = 4,
-	ProductSecured = 5,
-	Illegal = 6
+  Available = 0,
+  Reserved = 1,
+  BuyerAuthenticated = 2,
+  DealerAuthenticated = 3,
+  ProductInside = 4,
+  ProductSecured = 5,
+  Illegal = 6
 };
 #define STATE_ENUM_COUNT 7
 
 typedef struct
 {
-	Timer<>::Task task_ref;
-	bool (*fn)();
-	unsigned long millis;
+  Timer<>::Task task_ref;
+  bool (*fn)();
+  unsigned long millis;
 } RepeateableTask;
 
 /*******************
@@ -64,7 +77,7 @@ typedef struct
 RIC3D device;
 RIC3DMODEM g_modem;
 auto timer = timer_create_default();
-StateMachine state_machine(STATE_ENUM_COUNT, 9);
+StateMachine state_machine(STATE_ENUM_COUNT, 10);
 
 /*********************************
  * Filters
@@ -146,7 +159,7 @@ private:
  * COMMS
  *************************************/
 
-// Modem configuration 
+// Modem configuration
 const char apn[] = "grupotesacom.claro.com.ar"; // mobile network APN
 const char apn_user[] = "";                     // GPRS User (if needed)
 const char apn_password[] = "";                 // GPRS Password (if needed)
@@ -192,7 +205,7 @@ private:
   uint16_t read_interval_millis;
   uint16_t report_interval_millis;
 
-  public:
+public:
   AnalogSensor(
       String name,
       uint8_t port,
@@ -226,6 +239,9 @@ private:
   {
     float sensor_value = analogRead(port) / PORT_CORRECTION_FACTOR + correction;
 
+    Serial.print(analogRead(port));
+    Serial.print(",");
+
     if (sensor_value < 4 || sensor_value > 20)
     {
       if (!is_dead)
@@ -250,12 +266,19 @@ private:
 
     if (mem_index == mem_size)
     {
-      Serial.print("Memory overload on sensor " + name);
-      return -1;
+      Serial.println("Memory overload on sensor " + name);
+      mem_index = 0;
     }
     last_computed_value = sensor_value * unit_factor + unit_zero;
+
+    // Mannual correction for zero
+    if (-1 < last_computed_value && last_computed_value < 1)
+    {
+      last_computed_value = 0;
+    }
     mem[mem_index++] = last_computed_value;
 
+    Serial.println(last_computed_value);
     return last_computed_value;
   }
 
@@ -286,6 +309,7 @@ private:
 
   void send_report()
   {
+    Serial.println("Sending report");
     float sum = 0;
     for (int i = 0; i < mem_size; i++)
     {
@@ -341,16 +365,16 @@ private:
   }
 };
 
-SMA load_cell_filter(20);
+SMA load_cell_filter(4);
 AnalogSensor load_cell(
     "Load Cell",
     LOAD_INPUT,
-    4 / 16,
-    50 / 16,
-    200,
+    -(50 * 204.6) / (1023 - 204.6),
+    50.0 / (1023 - 204.6),
+    READ_LOAD_MILLIS,
     SEND_REPORT_MILLIS,
     &load_cell_filter,
-    -0.3,
+    0,
     true);
 
 /*******************
@@ -359,15 +383,19 @@ AnalogSensor load_cell(
 
 void set_up_state_machine();
 bool flash_error_led();
+void print_state();
 // Timed tasks
 bool read_load();
 bool read_door_status();
-bool check_buyers();
+bool check_for_reservation();
+bool read_dealer_auth();
+bool read_buyer_auth();
+bool send_load_report();
 
 // Utils
 uint8_t pullupRead(uint8_t pin)
 {
-	return !digitalRead(pin);
+  return !digitalRead(pin);
 }
 
 /*******************
@@ -376,34 +404,34 @@ uint8_t pullupRead(uint8_t pin)
 
 struct
 {
-	bool door_open;
-	bool lock_open;
-	bool reserved;
-	bool dealer_authenticated;
-	bool buyer_authenticated;
-	float load;
+  bool door_open;
+  bool lock_open;
+  bool reserved;
+  bool dealer_authenticated;
+  bool buyer_authenticated;
+  float load;
 
-	struct
-	{
-		RepeateableTask flash_error = {nullptr, flash_error_led, 200};
-	} repeatable_tasks;
+  struct
+  {
+    RepeateableTask flash_error = {nullptr, flash_error_led, 200};
+  } repeatable_tasks;
 } state;
 
 void start_task(RepeateableTask task)
 {
-	if (task.task_ref == nullptr)
-	{
-		task.task_ref = timer.every(task.millis, task.fn);
-	}
+  if (task.task_ref == nullptr)
+  {
+    task.task_ref = timer.every(task.millis, task.fn);
+  }
 }
 
 void stop_task(RepeateableTask task)
 {
-	if (task.task_ref != nullptr)
-	{
-		timer.cancel(task.task_ref);
-		task.task_ref = nullptr;
-	}
+  if (task.task_ref != nullptr)
+  {
+    timer.cancel(task.task_ref);
+    task.task_ref = nullptr;
+  }
 }
 
 /*******************
@@ -412,57 +440,63 @@ void stop_task(RepeateableTask task)
 
 void setup()
 {
-	// Inputs
-	pinMode(DOOR_INPUT, INPUT_PULLUP);
-	pinMode(BUY_INPUT, INPUT_PULLUP);
-	pinMode(LOAD_INPUT, INPUT);
+  // Inputs
+  pinMode(DOOR_INPUT, INPUT_PULLUP);
+  pinMode(BUY_INPUT, INPUT_PULLUP);
+  pinMode(LOAD_INPUT, INPUT);
   pinMode(AI1, INPUT);
-	// Outputs
-	pinMode(DOOR_OUTPUT, OUTPUT);
-	pinMode(LOCK_OUTPUT, OUTPUT);
-	// Output LEDs
-	pinMode(STATUS_LED, OUTPUT);
-	pinMode(OUTPUT_LED1, OUTPUT);
-	pinMode(OUTPUT_LED2, OUTPUT);
-	pinMode(ERROR_LED, OUTPUT);
+#ifdef AUTH_BUYER_INPUT
+  pinMode(AUTH_BUYER_INPUT, INPUT_PULLUP);
+#endif
+#ifdef AUTH_DEALER_INPUT
+  pinMode(AUTH_DEALER_INPUT, INPUT_PULLUP);
+#endif
+  // Outputs
+  pinMode(DOOR_OUTPUT, OUTPUT);
+  pinMode(LOCK_OUTPUT, OUTPUT);
+  // Output LEDs
+  pinMode(STATUS_LED, OUTPUT);
+  pinMode(OUTPUT_LED1, OUTPUT);
+  pinMode(OUTPUT_LED2, OUTPUT);
+  pinMode(ERROR_LED, OUTPUT);
 
-	Serial.begin(115200);
+  Serial.begin(115200);
 
-	timer.every(200, read_door_status);
-	timer.every(200, read_load);
-	timer.every(200, check_buyers);
-  timer.every(1000, []() {
-    state.load = load_cell.read();
-    return true;
-  });
-  timer.every(SEND_REPORT_MILLIS, []() {load_cell.send_report(); return true;});
+  timer.every(DIGITAL_INPUT_READ_MILLIS, read_door_status);
+  timer.every(READ_LOAD_MILLIS, read_load);
+  timer.every(DIGITAL_INPUT_READ_MILLIS, check_for_reservation);
+  timer.every(SEND_REPORT_MILLIS, send_load_report);
+  timer.every(2000, print_state);
+  timer.every(DIGITAL_INPUT_READ_MILLIS, read_buyer_auth);
+  timer.every(DIGITAL_INPUT_READ_MILLIS, read_dealer_auth);
 
   analogReference(INTERNAL2V56);
 
-	set_up_state_machine();
+  set_up_state_machine();
 
-	state_machine.SetState(Available, true, false);
+  state_machine.SetState(Available, true, false);
 
-	digitalWrite(STATUS_LED, HIGH);
+  digitalWrite(STATUS_LED, HIGH);
 
   // Default state
   state.door_open = true;
   state.lock_open = true;
+  state.buyer_authenticated = false;
+  state.dealer_authenticated = false;
+  state.reserved = false;
 
-	Serial.println("Device ready V2");
+  Serial.println("Device ready V3");
 }
-
-unsigned long long count = 0;
 
 void loop()
 {
   timer.tick();
-	state_machine.Update();
+  state_machine.Update();
 
   digitalWrite(DOOR_OUTPUT, state.door_open ? HIGH : LOW);
   digitalWrite(LOCK_OUTPUT, state.lock_open ? HIGH : LOW);
 
-	delay(100);
+  delay(100);
 }
 
 /*******************
@@ -472,103 +506,130 @@ void loop()
 void set_up_state_machine()
 {
   Serial.println("Setting up state machine...");
-	/**************************
-	 * Transitions
-	 ***************************/
-	// Available
-	state_machine.AddTransition(Available, Reserved, []()
-								{ return state.reserved; });
-	state_machine.AddTransition(Available, Illegal, []()
-								{ return state.load != 0; });
-	// Reserved
-	state_machine.AddTransition(Reserved, DealerAuthenticated, []()
-								{ return state.dealer_authenticated; });
-	state_machine.AddTransition(Reserved, Illegal, []()
-								{ return state.load != 0; });
-	// BuyerAuthenticated
-	state_machine.AddTransition(DealerAuthenticated, ProductInside, []()
-								{ return state.load != 0; });
-	// ProductInside
-	state_machine.AddTransition(ProductInside, DealerAuthenticated, []()
-								{ return state.load == 0; });
-	state_machine.AddTransition(ProductInside, ProductSecured, []() // TODO: store the load and check also for weight changes
-								{ return !state.door_open && state.load != 0 && !state.lock_open; });
-	// ProductSecured
-	state_machine.AddTransition(ProductSecured, BuyerAuthenticated, []()
-								{ return state.buyer_authenticated; });
-	// BuyerAuthenticated
-	state_machine.AddTransition(BuyerAuthenticated, Available, []()
-								{ return state.door_open && state.load == 0; });
-	// Illegal
+  /**************************
+   * Transitions
+   ***************************/
+  // Available
+  state_machine.AddTransition(Available, Reserved, []()
+                              { return state.reserved; });
+  state_machine.AddTransition(Available, Illegal, []()
+                              { return millis() > TRANSITION_MILLIS && state.load > MIN_WEIGHT_THRESHOLD; });
+  // Reserved
+  state_machine.AddTransition(Reserved, DealerAuthenticated, []()
+                              { return state.dealer_authenticated; });
+  state_machine.AddTransition(Reserved, Illegal, []()
+                              { return state.load > MIN_WEIGHT_THRESHOLD; });
+  // BuyerAuthenticated
+  state_machine.AddTransition(DealerAuthenticated, ProductInside, []()
+                              { return state.load > MIN_WEIGHT_THRESHOLD; });
+  // ProductInside
+  state_machine.AddTransition(ProductInside, DealerAuthenticated, []()
+                              { return state.load < MIN_WEIGHT_THRESHOLD; });
+  state_machine.AddTransition(ProductInside, ProductSecured, []() // TODO: store the load and check also for weight changes
+                              { return !state.door_open && state.load > MIN_WEIGHT_THRESHOLD && !state.lock_open; });
+  // ProductSecured
+  state_machine.AddTransition(ProductSecured, BuyerAuthenticated, []()
+                              { return state.buyer_authenticated; });
+  // BuyerAuthenticated
+  state_machine.AddTransition(BuyerAuthenticated, Available, []()
+                              { return state.door_open && state.load < MIN_WEIGHT_THRESHOLD; });
+  // Illegal
+  state_machine.AddTransition(Illegal, Available, []()
+                              {
+    // If the box is set to its base state, the alarm goes away 
+    return state.door_open && -1 < state.load && state.load < MIN_WEIGHT_THRESHOLD; });
 
-	/**************************
-	 * State Events
-	 ***************************/
-	state_machine.SetOnEntering(Available, []()
-								{ return; });
-	state_machine.SetOnEntering(Reserved, []()
-								{ state.dealer_authenticated = true; });
-	state_machine.SetOnEntering(DealerAuthenticated, []()
-								{ 
+  /**************************
+   * State Events
+   ***************************/
+#ifndef AUTH_DEALER_INPUT
+  state_machine.SetOnEntering(Reserved, []()
+                              { state.dealer_authenticated = true; });
+#endif
+  state_machine.SetOnEntering(DealerAuthenticated, []()
+                              { 
 		// Dealer has a limited time to open the door and secure the product
 		timer.in(MAX_DELIVERY_MILLIS, []() {
 			if (state_machine.GetState() == DealerAuthenticated)
 			{
-				state_machine.SetState(Illegal, true, false);
+				state_machine.SetState(Illegal, true, true);
 			}
 		}); });
-	state_machine.SetOnEntering(ProductInside, []()
-								{ state.lock_open = false; });
-	state_machine.SetOnEntering(ProductSecured, []()
-								{ state.buyer_authenticated = true; });
-	state_machine.SetOnEntering(BuyerAuthenticated, []()
-								{ state.lock_open = true; });
-	state_machine.SetOnEntering(Illegal, []()
-								{ start_task(state.repeatable_tasks.flash_error); });
-
-	state_machine.SetOnLeaving(Reserved, []()
-							   { state.dealer_authenticated = false; }); // Reset state
-	state_machine.SetOnLeaving(ProductSecured, []()
-							   { return state.buyer_authenticated = false; }); // Reset state
-	state_machine.SetOnLeaving(Illegal, []()
-							   { stop_task(state.repeatable_tasks.flash_error); });
+  state_machine.SetOnEntering(ProductInside, []()
+                              { state.lock_open = false; });
+#ifndef AUTH_BUYER_INPUT
+  state_machine.SetOnEntering(ProductSecured, []()
+                              { Serial.println("Authenticating buyer automatically"); state.buyer_authenticated = true; });
+#endif
+  state_machine.SetOnEntering(BuyerAuthenticated, []()
+                              { state.lock_open = true; });
+  state_machine.SetOnEntering(Illegal, []()
+                              { start_task(state.repeatable_tasks.flash_error); });
+  state_machine.SetOnLeaving(Reserved, []()
+                             { state.dealer_authenticated = false; }); // Reset state
+  state_machine.SetOnLeaving(ProductSecured, []()
+                             { return state.buyer_authenticated = false; }); // Reset state
+  state_machine.SetOnLeaving(Illegal, []()
+                             { 
+                              stop_task(state.repeatable_tasks.flash_error); 
+                              digitalWrite(ERROR_LED, LOW); });
   Serial.println("State machine set.");
 }
 
 bool read_load()
 {
-	state.load = analogRead(LOAD_INPUT);
-	return true;
+  state.load = load_cell.read();
+  return true;
 }
 
 bool read_door_status()
 {
-	if(pullupRead(DOOR_INPUT) == LOW) {
+#ifdef DOOR_TOGGLE
+  if (pullupRead(DOOR_INPUT) == LOW)
+  {
     return true;
   }
 
-	// Cannot open door if lock is closed
-	if (!state.door_open && !state.lock_open)
-	{
-		return true;
-	}
+  // Cannot open door if lock is closed
+  if (!state.door_open && !state.lock_open)
+  {
+    return true;
+  }
 
   state.door_open = !state.door_open;
-	return true;
+  return true;
+#else
+  // Set door state based on input
+  auto new_state = pullupRead(DOOR_INPUT) == HIGH;
+  if (new_state != state.door_open)
+  {
+    // Cannot open door if lock is closed
+    if (new_state && !state.lock_open)
+    {
+      return true;
+    }
+    state.door_open = new_state;
+  }
+  return true;
+#endif
 }
 
-bool check_buyers()
+bool check_for_reservation()
 {
-	if (!state.reserved && pullupRead(BUY_INPUT) == HIGH)
-	{
-		state.reserved = true;
-	}
+  if (!state.reserved && pullupRead(BUY_INPUT) == HIGH)
+  {
+    state.reserved = true;
+  }
+  else
+  {
+    state.reserved = false;
+  }
 }
 
 bool flash_error_led()
 {
-	digitalWrite(ERROR_LED, !digitalRead(ERROR_LED));
-	return true;
+  digitalWrite(ERROR_LED, !digitalRead(ERROR_LED));
+  return true;
 }
 
 void modem_setup()
@@ -632,3 +693,55 @@ void comm_init()
   }
 }
 
+void print_state()
+{
+  switch (state_machine.GetState())
+  {
+    Serial.print("Current state: ");
+  case Available:
+    Serial.println("Available");
+    break;
+  case Reserved:
+    Serial.println("Reserved");
+    break;
+  case BuyerAuthenticated:
+    Serial.println("BuyerAuthenticated");
+    break;
+  case DealerAuthenticated:
+    Serial.println("DealerAuthenticated");
+    break;
+  case ProductInside:
+    Serial.println("ProductInside");
+    break;
+  case ProductSecured:
+    Serial.println("ProductSecured");
+    break;
+  case Illegal:
+    Serial.println("Illegal");
+    break;
+  default:
+    break;
+  }
+}
+
+bool read_dealer_auth()
+{
+#ifdef AUTH_DEALER_INPUT
+  state.dealer_authenticated = pullupRead(AUTH_DEALER_INPUT) == HIGH;
+#endif
+  return true;
+}
+
+bool read_buyer_auth()
+{
+#ifdef AUTH_BUYER_INPUT
+  state.buyer_authenticated = pullupRead(AUTH_BUYER_INPUT) == HIGH;
+#endif
+  return true;
+}
+
+bool send_load_report()
+{
+  load_cell.send_report();
+  return true;
+}
