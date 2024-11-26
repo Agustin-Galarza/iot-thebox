@@ -8,8 +8,7 @@
  * Configurations
  ********************/
 #define MAX_DELIVERY_MILLIS 10000
-#define PLOTS_ENABLED false
-#define COMMS_ENABLED false
+#define COMMS_ENABLED
 #define SEND_REPORT_MILLIS 60000
 #define READ_LOAD_MILLIS 1000
 #define MIN_WEIGHT_THRESHOLD 2.5
@@ -258,11 +257,6 @@ public:
         sensor_value = last_value;
       }
     }
-    if (PLOTS_ENABLED)
-    {
-      Serial.print(sensor_value);
-      Serial.print(", ");
-    }
 
     if (mem_index == mem_size)
     {
@@ -323,40 +317,31 @@ public:
     char buff[10] = {0};
 
     floatToString(min_value, buff, sizeof(buff), 3);
-    if (COMMS_ENABLED)
-    {
-      comm_failure = comm_failure || !g_modem.publishData("min", buff);
-    }
-    else
-    {
-      Serial.print(name + " report -> ");
-      Serial.print("Min: ");
-      Serial.print(buff);
-      Serial.print(" || ");
-    }
+#ifdef COMMS_ENABLED
+    comm_failure = comm_failure || !g_modem.publishData("min", buff);
+#else
+    Serial.print(name + " report -> ");
+    Serial.print("Min: ");
+    Serial.print(buff);
+    Serial.print(" || ");
+#endif
 
     floatToString(max_value, buff, sizeof(buff), 3);
-    if (COMMS_ENABLED)
-    {
-      comm_failure = comm_failure || !g_modem.publishData("max", buff);
-    }
-    else
-    {
-      Serial.print("Max: ");
-      Serial.print(buff);
-      Serial.print(" || ");
-    }
+#ifdef COMMS_ENABLED
+    comm_failure = comm_failure || !g_modem.publishData("max", buff);
+#else
+    Serial.print("Max: ");
+    Serial.print(buff);
+    Serial.print(" || ");
+#endif
 
     floatToString(avg, buff, sizeof(buff), 3);
-    if (COMMS_ENABLED)
-    {
-      comm_failure = comm_failure || !g_modem.publishData("avg", buff);
-    }
-    else
-    {
-      Serial.print("Avg: ");
-      Serial.println(buff);
-    }
+#ifdef COMMS_ENABLED
+    comm_failure = comm_failure || !g_modem.publishData("avg", buff);
+#else
+    Serial.print("Avg: ");
+    Serial.println(buff);
+#endif
 
     if (comm_failure)
     {
@@ -461,6 +446,10 @@ void setup()
   pinMode(ERROR_LED, OUTPUT);
 
   Serial.begin(115200);
+#ifdef COMMS_ENABLED
+  Serial.println("Comms enabled");
+  comm_init();
+#endif
 
   timer.every(DIGITAL_INPUT_READ_MILLIS, read_door_status);
   timer.every(READ_LOAD_MILLIS, read_load);
