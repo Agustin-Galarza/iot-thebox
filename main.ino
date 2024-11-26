@@ -14,8 +14,10 @@ const char *device_id = "the-box-sm-ml-01";
 #define MIN_WEIGHT_THRESHOLD 2.5
 // lapse of time to check for digital input state
 #define DIGITAL_INPUT_READ_MILLIS 200
+// How much should the weight value change (in kilos) in order to consider that the box contents have been modified
 #define LOAD_CHANGE_EPSILON 2
 
+// When defined, the MQTT modem will be initiated and data will be pushed to the Platform
 // #define COMMS_ENABLED
 
 // Comment this line to set the door state as equals to the input state
@@ -45,7 +47,6 @@ const char *device_id = "the-box-sm-ml-01";
 /*******************
  * Miscelaneous Configuration
  ********************/
-#define TIMER_CONCURRENT_TASKS 6
 #define PORT_CORRECTION_FACTOR 1
 #define SerialAT Serial3 // 4G modem comms
 
@@ -583,10 +584,12 @@ void set_up_state_machine()
   // ProductInside
   state_machine.AddTransition(ProductInside, Illegal, []()
                               { if ((millis() - state.product_inside_ts > TRANSITION_MILLIS + 500) && abs(state.load - state.load_when_product_inside) > LOAD_CHANGE_EPSILON) {
+                                  Serial.println("ALERT - Box weight has changed!");
                                   Serial.print("Load when inside: ");
                                   Serial.print(state.load_when_product_inside);
                                   Serial.print("  ||  Current load: ");
                                   Serial.println(state.load);
+
                                 return true;
                               } return false; });
   state_machine.AddTransition(ProductInside, DealerAuthenticated, []()
@@ -596,6 +599,7 @@ void set_up_state_machine()
   // ProductSecured
   state_machine.AddTransition(ProductSecured, Illegal, []()
                               { if ((millis() - state.product_inside_ts > TRANSITION_MILLIS + 500) && abs(state.load - state.load_when_product_inside) > LOAD_CHANGE_EPSILON) {
+                                  Serial.println("ALERT - Box weight has changed!");
                                   Serial.print("Load when inside: ");
                                   Serial.print(state.load_when_product_inside);
                                   Serial.print("  ||  Current load: ");
@@ -617,7 +621,8 @@ void set_up_state_machine()
    * State Events
    ***************************/
   state_machine.SetOnEntering(Available, []()
-                              { state.load_when_product_inside = 0; 
+                              { state.load_when_product_inside = 0;
+                              Serial.println("Box available and ready to use!"); 
                                 digitalWrite(OUTPUT_LED1, HIGH); });
 #ifndef AUTH_DEALER_INPUT
   state_machine.SetOnEntering(Reserved, []()
@@ -800,7 +805,7 @@ void comm_init()
   int result;
   while (result = modem_init())
   {
-    Serial.print(F("FAILURE! -> "));
+    Serial.print(F("FAILURE! - Error code: "));
     Serial.println(result);
     delay(10000);
   }
@@ -833,6 +838,7 @@ void print_state()
     Serial.println("Illegal");
     break;
   default:
+    Serial.println("Unknown");
     break;
   }
 }
